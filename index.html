@@ -3111,7 +3111,7 @@
           color: var(--fg-faded);
         "
       >
-        v2.3.3
+        v2.3.4
       </p>
       <p class="disclaimer" style="margin-top: 12px">
         <button
@@ -3198,9 +3198,28 @@
       // ── Dual-Screen Player View ──────────────────────────────────────────────
       // Detect if this window is the popup (opened with ?pvpopup=1 in the URL).
       const IS_PV_POPUP = new URLSearchParams(window.location.search).has("pvpopup");
-      // BroadcastChannel for main ↔ popup communication (same origin only).
-      const _pvChannel = (typeof BroadcastChannel !== "undefined")
-        ? new BroadcastChannel("dolmenwood-pv-sync") : null;
+      // Main <-> popup communication via window.postMessage. BroadcastChannel is
+      // partitioned by top-level site inside iframes: e.g. itch.io embeds the game
+      // in an iframe on itch.io while the popup opens at html-classic.itch.zone as
+      // its own top-level site, so channel messages never cross the partition.
+      // Direct window references (opener / popup handle) are not partitioned.
+      // Target the exact origin for http(s) (the itch.io popup and localhost both
+      // share their origin), but fall back to "*" for file:// and other opaque
+      // origins. Opened locally, Chrome reports window.location.origin as "file://"
+      // yet each window's REAL origin is opaque ("null"), so a specific targetOrigin
+      // would never match and Chrome would silently drop every message (breaking
+      // dual-screen locally). The receive-side e.source peer check still gates access.
+      const _PV_MSG_TARGET = /^https?:$/.test(window.location.protocol)
+        ? window.location.origin : "*";
+      function pvPostToPeer(msg) {
+        try {
+          if (IS_PV_POPUP) {
+            if (window.opener && !window.opener.closed) window.opener.postMessage(msg, _PV_MSG_TARGET);
+          } else if (_pvPopupWin && !_pvPopupWin.closed) {
+            _pvPopupWin.postMessage(msg, _PV_MSG_TARGET);
+          }
+        } catch (e) {}
+      }
       // Reference to the popup window (main window only).
       let _pvPopupWin = null;
       // Polling interval for detecting popup closure.
@@ -3249,7 +3268,7 @@
 
       // Broadcast current state from main → popup.
       function pvBroadcastState() {
-        if (!_pvChannel) return;
+        if (!_pvPopupWin || _pvPopupWin.closed) return;
         if (IS_PV_POPUP) return; // popup never broadcasts state
         const hexEl = document.getElementById("pan-hex");
         const vantageEl = document.getElementById("pan-vantage");
@@ -3260,7 +3279,7 @@
         // use it as-is — compute what fog *should* be for a PV window instead.
         const rawFog = fogEl ? fogEl.dataset.active === "1" : false;
         const fogForPopup = rawFog || !!settingsGet("fogInPlayerView");
-        _pvChannel.postMessage({
+        pvPostToPeer({
           type: "dv-state",
           hex: hexEl ? hexEl.value : "",
           vantage: vantageEl ? (parseInt(vantageEl.value, 10) || 6) : 6,
@@ -3299,19 +3318,23 @@
       }
 
       // Set up channel listeners — popup listens for state; main listens for hex clicks.
-      if (_pvChannel) {
-        _pvChannel.onmessage = function (e) {
-          const msg = e.data || {};
-          if (IS_PV_POPUP) {
-            if (msg.type === "dv-state") pvApplyState(msg);
-          } else {
-            // Main window receives a hex click from the popup.
-            if (msg.type === "dv-hex-click" && msg.hex) {
-              if (typeof jumpToDetail === "function") jumpToDetail(msg.hex);
-            }
+      window.addEventListener("message", function (e) {
+        // Only accept messages from our dual-screen peer window reference.
+        var expectedSource = IS_PV_POPUP ? window.opener : _pvPopupWin;
+        if (expectedSource && e.source && e.source !== expectedSource) return;
+        const msg = e.data || {};
+        if (IS_PV_POPUP) {
+          if (msg.type === "dv-state") pvApplyState(msg);
+        } else {
+          // Main window receives messages from the popup.
+          if (msg.type === "dv-hex-click" && msg.hex) {
+            if (typeof jumpToDetail === "function") jumpToDetail(msg.hex);
+          } else if (msg.type === "dv-popup-ready") {
+            // Popup finished loading -- push the current state immediately.
+            pvBroadcastState();
           }
-        };
-      }
+        }
+      });
 
       // Popup init: runs after DOM is ready (called from DOMContentLoaded below).
       function pvPopupInit() {
@@ -3331,7 +3354,7 @@
         // Set window title.
         document.title = "Player View — Dolmenwood";
         // Tell main we're ready.
-        if (_pvChannel) _pvChannel.postMessage({ type: "dv-popup-ready" });
+        pvPostToPeer({ type: "dv-popup-ready" });
       }
 
       // Embedded data
@@ -13424,6 +13447,8 @@
           const lakes = HEX_LAKES[hexCode];
           if (!lakes) continue;
           const info = hexDrawInfo[hexCode];
+          // Player View: an unseen hex shows no lakes (same rule as roads/rivers).
+          if (isPlayerView() && settingsGet("vantageHidesRoads") && info && info.blocked) continue;
           for (const lake of lakes) {
             const ratio = LAKE_SIZE_RATIO[lake.size] || 0.5;
             const rx = r * ratio * 0.9; // slightly wider
@@ -13944,7 +13969,7 @@
         // Never process track intercepts or navigate locally in the popup — doing so
         // causes trackHandleHexClick to fire twice (once here, once on main).
         if (IS_PV_POPUP) {
-          if (_pvChannel) _pvChannel.postMessage({ type: "dv-hex-click", hex });
+          pvPostToPeer({ type: "dv-hex-click", hex });
           return;
         }
 
